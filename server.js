@@ -21,12 +21,11 @@ app.get('/ping', (req, res) => {
 });
 
 async function runYtDlp(args) {
-  try {
-    const { stdout } = await execAsync(`yt-dlp ${args}`, { timeout: 60000 });
-    return stdout;
-  } catch (e) {
-    throw new Error(e.message);
-  }
+  const { stdout } = await execAsync(`yt-dlp ${args}`, {
+    timeout: 120000,
+    maxBuffer: 10 * 1024 * 1024
+  });
+  return stdout;
 }
 
 app.get('/api/info', async (req, res) => {
@@ -48,37 +47,67 @@ app.get('/api/info', async (req, res) => {
       const seen = new Set();
       videoFormats.forEach(f => {
         const key = `${f.height || 'unknown'}p`;
-        if (!seen.has(key) && result.formats.length < 3) {
+        if (!seen.has(key) && result.formats.filter(x=>x.type==='video').length < 4) {
           seen.add(key);
-          result.formats.push({ type: 'video', quality: key, url: f.url, ext: f.ext || 'mp4' });
+          result.formats.push({
+            type: 'video',
+            quality: key,
+            url: f.url,
+            ext: f.ext || 'mp4'
+          });
         }
       });
       const audioFormats = info.formats
         .filter(f => f.vcodec === 'none' && f.acodec !== 'none' && f.url)
         .sort((a, b) => (b.abr || 0) - (a.abr || 0));
       if (audioFormats.length > 0) {
-        result.formats.push({ type: 'audio', quality: 'Best Audio', url: audioFormats[0].url, ext: 'mp3' });
+        result.formats.push({
+          type: 'audio',
+          quality: 'Best Audio',
+          url: audioFormats[0].url,
+          ext: 'mp3'
+        });
       }
     }
     if (result.formats.length === 0 && info.url) {
-      result.formats.push({ type: 'video', quality: 'Best', url: info.url, ext: info.ext || 'mp4' });
+      result.formats.push({
+        type: 'video',
+        quality: 'Best',
+        url: info.url,
+        ext: info.ext || 'mp4'
+      });
     }
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: 'Could not extract media', detail: err.message });
+    res.status(500).json({ error: 'Could not extract', detail: err.message });
   }
 });
 
 app.get('/api/proxy', (req, res) => {
   const url = req.query.url;
+  const filename = req.query.filename || 'download';
   if (!url) return res.status(400).json({ error: 'URL required' });
   const protocol = url.startsWith('https') ? https : http;
-  protocol.get(url, (response) => {
-    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
-    if (response.headers['content-length']) {
-      res.setHeader('Content-Length', response.headers['content-length']);
+  protocol.get(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://www.google.com/'
     }
-    res.setHeader('Content-Disposition', 'attachment');
+  }, (response) => {
+    if (response.statusCode === 301 || response.statusCode === 302) {
+      const red = response.headers.location;
+      const rp = red.startsWith('https') ? https : http;
+      rp.get(red, (r2) => {
+        res.setHeader('Content-Type', r2.headers['content-type'] || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        if (r2.headers['content-length']) res.setHeader('Content-Length', r2.headers['content-length']);
+        r2.pipe(res);
+      });
+      return;
+    }
+    res.setHeader('Content-Type', response.headers['content-type'] || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    if (response.headers['content-length']) res.setHeader('Content-Length', response.headers['content-length']);
     response.pipe(res);
   }).on('error', (e) => res.status(500).json({ error: e.message }));
 });
