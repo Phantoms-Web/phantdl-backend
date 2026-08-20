@@ -6,8 +6,8 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const https = require('https');
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const crypto = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -19,9 +19,27 @@ app.use(helmet({
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ───────────────────────────────────────────────
-// RATE LIMITING — prevents abuse / runaway costs
-// ───────────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+} else {
+  console.warn('SUPABASE_URL / SUPABASE_KEY not set — stats endpoints will be disabled.');
+}
+
+const KNOWN_PLATFORMS = ['tiktok', 'youtube', 'instagram', 'facebook', 'twitter', 'soundcloud', 'terabox'];
+
+const IP_SALT = process.env.IP_SALT || 'change-this-salt-in-render-env-vars';
+function hashIp(ip) {
+  return crypto.createHash('sha256').update(IP_SALT + '|' + ip).digest('hex');
+}
+function getClientIp(req) {
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.socket.remoteAddress || 'unknown';
+}
+
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
@@ -31,11 +49,6 @@ const apiLimiter = rateLimit({
 });
 app.use('/api/', apiLimiter);
 
-// ───────────────────────────────────────────────
-// SSRF / INPUT SAFETY GUARD
-// Blocks requests aimed at internal/private network
-// addresses and non-http(s) protocols.
-// ───────────────────────────────────────────────
 function isSafeUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
@@ -61,76 +74,154 @@ function sanitizeFilename(name) {
   return cleaned || 'download';
 }
 
-// ───────────────────────────────────────────────
-// PERSISTENT DOWNLOAD COUNTER
-// Stored in a local JSON file. NOTE: on Render's
-// free tier, the filesystem is ephemeral — a fresh
-// deploy or a cold restart after long inactivity can
-// reset this file. See chat notes for an upgrade path
-// (e.g. JSONBin/Supabase) if true permanence is needed.
-// ───────────────────────────────────────────────
-const COUNTER_FILE = path.join(__dirname, 'counter.json');
-
-function loadCounter() {
-  try {
-    const raw = fs.readFileSync(COUNTER_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    return typeof parsed.count === 'number' && parsed.count >= 0 ? parsed.count : 0;
-  } catch (e) {
-    return 0;
-  }
+function detectPlatform(rawUrl) {
+  const url = String(rawUrl || '').toLowerCase();
+  if (url.includes('tiktok.com')) return 'tiktok';
+  if (url.includes('instagram.com')) return 'instagram';
+  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'youtube';
+  if (url.includes('facebook.com') || url.includes('fb.watch')) return 'facebook';
+  if (url.includes('twitter.com') || url.includes('x.com')) return 'twitter';
+  if (url.includes('soundcloud.com')) return 'soundcloud';
+  if (url.includes('terabox.com') || url.includes('1024terabox.com')) return 'terabox';
+  return null;
 }
 
-function saveCounter(count) {
-  try {
-    fs.writeFileSync(COUNTER_FILE, JSON.stringify({ count, updatedAt: Date.now() }), 'utf8');
-  } catch (e) {
-    console.error('Counter save failed:', e.message);
-  }
-}
-
-let downloadCount = loadCounter();
-let writeQueued = false;
-function persistCounterSoon() {
-  if (writeQueued) return;
-  writeQueued = true;
-  setTimeout(() => { saveCounter(downloadCount); writeQueued = false; }, 300);
-}
-
-app.get('/api/counter', (req, res) => {
-  res.json({ count: downloadCount });
-});
-
-app.post('/api/counter/increment', (req, res) => {
-  downloadCount += 1;
-  persistCounterSoon();
-  res.json({ count: downloadCount });
-});
-
-// ───────────────────────────────────────────────
-// HEALTH / WAKE-UP
-// ───────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'PhantDL Backend Running!' });
 });
 
 app.get('/ping', (req, res) => {
-  res.json({ pong: true, count: downloadCount });
+  res.json({ pong: true });
 });
 
-// ───────────────────────────────────────────────
-// yt-dlp WRAPPER
-// Uses execFile with an argument array (NOT a shell
-// string) so URLs can never break out into shell
-// commands — this closes a command-injection hole
-// that existed in the previous version.
-// ───────────────────────────────────────────────
+app.post('/api/visit', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Stats temporarily unavailable' });
+  try {
+    const visitorHash = hashIp(getClientIp(req));
+    const { error } = await supabase.from('visits').insert({ visitor_hash: visitorHash });
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('visit tracking failed:', err.message);
+    res.status(500).json({ error: 'Could not record visit' });
+  }
+});
+
+app.get('/api/stats', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Stats temporarily unavailable' });
+  try {
+    const { count: totalVisits, error: visitsErr } = await supabase
+      .from('visits').select('*', { count: 'exact', head: true });
+    if (visitsErr) throw visitsErr;
+
+    const { data: uniqueRows, error: uniqueErr } = await supabase
+      .from('visits').select('visitor_hash');
+    if (uniqueErr) throw uniqueErr;
+    const uniqueVisitors = new Set((uniqueRows || []).map(r => r.visitor_hash)).size;
+
+    const { count: totalDownloads, error: dlErr } = await supabase
+      .from('downloads').select('*', { count: 'exact', head: true });
+    if (dlErr) throw dlErr;
+
+    res.json({
+      uniqueVisitors,
+      totalVisits: totalVisits || 0,
+      totalDownloads: totalDownloads || 0
+    });
+  } catch (err) {
+    console.error('stats fetch failed:', err.message);
+    res.status(500).json({ error: 'Could not load stats' });
+  }
+});
+
+app.get('/api/leaderboard', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Stats temporarily unavailable' });
+  try {
+    const { data, error } = await supabase
+      .from('platform_stats')
+      .select('platform, total_downloads')
+      .order('total_downloads', { ascending: false })
+      .limit(5);
+    if (error) throw error;
+    res.json({ leaderboard: data });
+  } catch (err) {
+    console.error('leaderboard fetch failed:', err.message);
+    res.status(500).json({ error: 'Could not load leaderboard' });
+  }
+});
+
+app.get('/api/counter', async (req, res) => {
+  if (!supabase) return res.json({ count: 0 });
+  try {
+    const { count, error } = await supabase
+      .from('downloads').select('*', { count: 'exact', head: true });
+    if (error) throw error;
+    res.json({ count: count || 0 });
+  } catch (err) {
+    res.status(500).json({ error: 'Could not load counter' });
+  }
+});
+
+app.post('/api/counter/increment', async (req, res) => {
+  if (!supabase) return res.status(503).json({ error: 'Stats temporarily unavailable' });
+  const { platform, contentType } = req.body || {};
+  const safePlatform = KNOWN_PLATFORMS.includes(platform) ? platform : null;
+
+  try {
+    if (safePlatform) {
+      const { error: insertErr } = await supabase
+        .from('downloads')
+        .insert({ platform: safePlatform, content_type: contentType || null });
+      if (insertErr) throw insertErr;
+
+      const { error: rpcErr } = await supabase.rpc('increment_platform_downloads', { p_platform: safePlatform });
+      if (rpcErr) throw rpcErr;
+    } else {
+      await supabase.from('downloads').insert({ platform: 'other', content_type: contentType || null });
+    }
+
+    const { count } = await supabase.from('downloads').select('*', { count: 'exact', head: true });
+    res.json({ count: count || 0 });
+  } catch (err) {
+    console.error('counter increment failed:', err.message);
+    res.status(500).json({ error: 'Could not update counter' });
+  }
+});
+
 async function runYtDlp(argsArray) {
   const { stdout } = await execFileAsync('yt-dlp', argsArray, {
     timeout: 120000,
     maxBuffer: 10 * 1024 * 1024
   });
   return stdout;
+}
+
+function fetchJson(targetUrl, options = {}) {
+  return new Promise((resolve, reject) => {
+    const protocol = targetUrl.startsWith('https') ? https : http;
+    const req = protocol.get(targetUrl, { timeout: 15000, ...options }, (response) => {
+      let data = '';
+      response.on('data', chunk => { data += chunk; });
+      response.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Invalid JSON from fallback API')); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Fallback API timeout')); });
+    req.on('error', reject);
+  });
+}
+
+async function tiktokFallback(url) {
+  const api = `https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`;
+  const json = await fetchJson(api);
+  if (json.code !== 0 || !json.data) throw new Error('TikTok fallback returned no data');
+  const d = json.data;
+  const formats = [];
+  if (d.play) formats.push({ type: 'video', quality: 'SD', url: d.play, ext: 'mp4' });
+  if (d.hdplay && d.hdplay !== d.play) formats.push({ type: 'video', quality: 'HD', url: d.hdplay, ext: 'mp4' });
+  if (d.music) formats.push({ type: 'audio', quality: 'Best Audio', url: d.music, ext: 'mp3' });
+  return { title: d.title || 'TikTok Video', thumbnail: d.cover || '', duration: d.duration || 0, formats };
 }
 
 app.get('/api/info', async (req, res) => {
@@ -158,12 +249,7 @@ app.get('/api/info', async (req, res) => {
         const key = `${f.height || 'unknown'}p`;
         if (!seen.has(key) && result.formats.filter(x => x.type === 'video').length < 4) {
           seen.add(key);
-          result.formats.push({
-            type: 'video',
-            quality: key,
-            url: f.url,
-            ext: f.ext || 'mp4'
-          });
+          result.formats.push({ type: 'video', quality: key, url: f.url, ext: f.ext || 'mp4' });
         }
       });
 
@@ -172,37 +258,29 @@ app.get('/api/info', async (req, res) => {
         .sort((a, b) => (b.abr || 0) - (a.abr || 0));
 
       if (audioFormats.length > 0) {
-        result.formats.push({
-          type: 'audio',
-          quality: 'Best Audio',
-          url: audioFormats[0].url,
-          ext: 'mp3'
-        });
+        result.formats.push({ type: 'audio', quality: 'Best Audio', url: audioFormats[0].url, ext: 'mp3' });
       }
     }
 
     if (result.formats.length === 0 && info.url) {
-      result.formats.push({
-        type: 'video',
-        quality: 'Best',
-        url: info.url,
-        ext: info.ext || 'mp4'
-      });
+      result.formats.push({ type: 'video', quality: 'Best', url: info.url, ext: info.ext || 'mp4' });
     }
 
     res.json(result);
-  } catch (err) {
-    res.status(500).json({ error: 'Could not extract', detail: err.message });
+  } catch (primaryErr) {
+    const platform = detectPlatform(url);
+    try {
+      if (platform === 'tiktok') {
+        const fallbackResult = await tiktokFallback(url);
+        return res.json(fallbackResult);
+      }
+      throw primaryErr;
+    } catch (fallbackErr) {
+      res.status(500).json({ error: 'Could not extract', detail: fallbackErr.message });
+    }
   }
 });
 
-// ───────────────────────────────────────────────
-// DOWNLOAD PROXY
-// Frontend sends every actual file download through
-// here. This is what makes Instagram/Twitter/Facebook/
-// YouTube downloads work despite the source CDNs
-// blocking direct cross-origin browser requests (CORS).
-// ───────────────────────────────────────────────
 app.get('/api/proxy', (req, res) => {
   const url = req.query.url;
   const filename = sanitizeFilename(req.query.filename);
