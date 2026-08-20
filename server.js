@@ -230,7 +230,7 @@ app.get('/api/info', async (req, res) => {
   if (!isSafeUrl(url)) return res.status(400).json({ error: 'Invalid URL' });
 
   try {
-    const raw = await runYtDlp(['--dump-json', '--no-playlist', url]);
+    const raw = await runYtDlp(['--dump-json', '--no-playlist', '-f', 'best[acodec!=none][vcodec!=none]/best', url]);
     const info = JSON.parse(raw);
     const result = {
       title: info.title || 'Media File',
@@ -260,6 +260,16 @@ app.get('/api/info', async (req, res) => {
       if (audioFormats.length > 0) {
         result.formats.push({ type: 'audio', quality: 'Best Audio', url: audioFormats[0].url, ext: 'mp3' });
       }
+    }
+
+    const hasVideo = result.formats.some(f => f.type === 'video');
+    if (!hasVideo && info.vcodec && info.vcodec !== 'none' && info.acodec && info.acodec !== 'none' && info.url) {
+      result.formats.unshift({
+        type: 'video',
+        quality: info.height ? `${info.height}p` : 'Best',
+        url: info.url,
+        ext: info.ext || 'mp4'
+      });
     }
 
     if (result.formats.length === 0 && info.url) {
