@@ -6,8 +6,12 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const https = require('https');
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const crypto = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
+const ffmpegPath = require('ffmpeg-static');
 
 const execFileAsync = promisify(execFile);
 const app = express();
@@ -230,12 +234,13 @@ app.get('/api/info', async (req, res) => {
   if (!isSafeUrl(url)) return res.status(400).json({ error: 'Invalid URL' });
 
   try {
-    const raw = await runYtDlp(['--dump-json', '--no-playlist', '-f', 'best[acodec!=none][vcodec!=none]/best', url]);
+    const raw = await runYtDlp(['--dump-json', '--no-playlist', url]);
     const info = JSON.parse(raw);
     const result = {
       title: info.title || 'Media File',
       thumbnail: info.thumbnail || '',
       duration: info.duration || 0,
+      sourceUrl: url,
       formats: []
     };
 
@@ -263,17 +268,8 @@ app.get('/api/info', async (req, res) => {
     }
 
     const hasVideo = result.formats.some(f => f.type === 'video');
-    if (!hasVideo && info.vcodec && info.vcodec !== 'none' && info.acodec && info.acodec !== 'none' && info.url) {
-      result.formats.unshift({
-        type: 'video',
-        quality: info.height ? `${info.height}p` : 'Best',
-        url: info.url,
-        ext: info.ext || 'mp4'
-      });
-    }
-
-    if (result.formats.length === 0 && info.url) {
-      result.formats.push({ type: 'video', quality: 'Best', url: info.url, ext: info.ext || 'mp4' });
+    if (!hasVideo) {
+      result.formats.unshift({ type: 'video', quality: 'Best (merged)', needsMerge: true, ext: 'mp4' });
     }
 
     res.json(result);
@@ -288,6 +284,37 @@ app.get('/api/info', async (req, res) => {
     } catch (fallbackErr) {
       res.status(500).json({ error: 'Could not extract', detail: fallbackErr.message });
     }
+  }
+});
+
+app.get('/api/merge-download', async (req, res) => {
+  const url = req.query.url;
+  const filename = sanitizeFilename(req.query.filename);
+  if (!url) return res.status(400).json({ error: 'URL required' });
+  if (!isSafeUrl(url)) return res.status(400).json({ error: 'Invalid or unsafe URL' });
+
+  const tmpFile = path.join(os.tmpdir(), `phantdl_${crypto.randomUUID()}.mp4`);
+  try {
+    await execFileAsync('yt-dlp', [
+      '-f', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best',
+      '--merge-output-format', 'mp4',
+      '--ffmpeg-location', ffmpegPath,
+      '--no-playlist',
+      '-o', tmpFile,
+      url
+    ], { timeout: 180000, maxBuffer: 20 * 1024 * 1024 });
+
+    if (!fs.existsSync(tmpFile)) throw new Error('Merged file was not created');
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    const stream = fs.createReadStream(tmpFile);
+    stream.pipe(res);
+    stream.on('close', () => fs.unlink(tmpFile, () => {}));
+    stream.on('error', () => fs.unlink(tmpFile, () => {}));
+  } catch (err) {
+    fs.unlink(tmpFile, () => {});
+    if (!res.headersSent) res.status(500).json({ error: 'Could not prepare video', detail: err.message });
   }
 });
 
